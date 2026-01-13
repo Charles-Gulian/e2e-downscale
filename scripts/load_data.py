@@ -181,7 +181,7 @@ class LoadModel:
 
     @staticmethod
     def markov_uniform(T):
-        # Define Markov process for sampling
+        # Define Markov process for sampling different quantiles
         rho = 0.9  # correlation parameter
         u = np.zeros(T)
         u[0] = np.random.rand()
