@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import cvxpy as cp
 import pathlib
 
@@ -65,22 +66,6 @@ class Node(Component):
     def from_series(cls, df: pd.Series):
         return cls(df.name, df)
 
-    # def get_load_profile(self, ts_pointer):
-    #     # Open / store load profile for object (can definitely make this more efficient)
-    #     ts_rel_path = ts_pointer.loc[
-    #         (ts_pointer.Simulation == "REAL_TIME") &
-    #         (ts_pointer.Parameter == "MW Load") &
-    #         (ts_pointer.Object == str(self.area)),
-    #         "Data File"
-    #     ].values[0].strip("..")  # Get path to load profile from time series pointer
-    #     ts_path = pathlib.Path(str(self.system.system_dir) + ts_rel_path)
-    #     df_load = pd.read_csv(ts_path)  # Read in load data
-    #     df_load = df_load.loc[::12, str(self.area)]  # Convert to hourly
-    #     df_load /= df_load.max()  # Normalize
-    #     df_load.index = pd.date_range(start="2020-01-01 00:00:00", end="2020-12-31 23:59:59",
-    #                                   freq="h")  # Add timeseries index
-    #     self.load_profile = df_load
-
     def get_load_profile(self, year):
         data_source = "NSRDB"
         ts_data_dir = self.system.base_dir / "load-data" / "profiles"
@@ -104,7 +89,7 @@ class Node(Component):
             cp.sum([r.p_out for r in self.resources])  # Nodal generation
             + cp.sum([l.flow for l in self.in_lines])  # + line inflows
             - cp.sum([l.flow for l in self.out_lines])  # - line outflows
-            >= self.load - self.unserved_energy,  # = load minus unserved energy (power balance constraint)
+            == self.load - self.unserved_energy,  # = load minus unserved energy (power balance constraint)
             self.unserved_energy <= self.load,  # Limit unserved energy
             self.theta <= self.theta_max, self.theta >= -self.theta_max  # Voltage angle limits
         ]
@@ -236,22 +221,6 @@ class VariableResource(Resource):
         # Initialize generation profile
         self.gen_profile = None
 
-    # def get_gen_profile(self, ts_pointer):
-    #     # ALREADY KNOWS RESOURCE TYPE, AND BUS ID
-    #     ts_rel_path = ts_pointer.loc[
-    #         (ts_pointer.Simulation == "REAL_TIME") &
-    #         (ts_pointer.Parameter == "PMax MW") &
-    #         (ts_pointer.Object == self.name),
-    #         "Data File"
-    #     ].values[0].strip("..")  # Get path to profile from time series pointer
-    #     ts_path = pathlib.Path(str(self.system.system_dir) + ts_rel_path)
-    #     df_profile = pd.read_csv(ts_path)  # Read in data
-    #     df_profile = df_profile.loc[::12, self.name]  # Convert to hourly
-    #     df_profile /= df_profile.max()  # Normalize
-    #     df_profile.index = pd.date_range(start="2020-01-01 00:00:00", end="2020-12-31 23:59:59",
-    #                                      freq="h")  # Add timeseries index
-    #     self.gen_profile = df_profile
-
     def get_gen_profile(self, year):
         # HACK (temporary)
         if self.resource_type == "solar":
@@ -273,7 +242,7 @@ class VariableResource(Resource):
 
 class StorageResource(Resource):
 
-    def __init__(self, name, data, duration=4):
+    def __init__(self, name, data, duration=4.0):
         super().__init__(name, data)
 
         # Cost attributes
@@ -282,7 +251,7 @@ class StorageResource(Resource):
         # Operational attributes
         self.duration = duration
         self.max_SOC = self.pmax * self.duration
-        self.efficiency = data["Storage Roundtrip Efficiency"]
+        self.efficiency = data["Storage Roundtrip Efficiency"] / 100
 
     def create_variables(self):
         self.charge = cp.Variable(T, nonneg=True)
@@ -299,8 +268,8 @@ class StorageResource(Resource):
             self.SOC <= self.max_SOC
         ]
         constraints += [
-            self.SOC[t] == self.SOC[np.mod(t - 1, T)] + self.efficiency * self.charge[np.mod(t - 1, T)] -
-            self.discharge[np.mod(t - 1, T)]
+            self.SOC[t] == self.SOC[np.mod(t - 1, T)] + self.efficiency * self.charge[np.mod(t - 1, T)]
+            - self.discharge[np.mod(t - 1, T)]
             for t in range(T)
         ]
         return constraints
@@ -309,17 +278,20 @@ class StorageResource(Resource):
 ### SYSTEM ###
 
 class System:
-    def __init__(self, base_dir, system_dir):
+    def __init__(self, base_dir, system_dir, system_config):
 
         # Save base directory, system directory
         self.base_dir = base_dir
         self.system_dir = system_dir
+        self.system_config = system_config
+
+        # Current date for OPF dispatch results (placeholder)
+        self.opf_date = None
 
         # Read in data for IEEE RTS GMLC (Reliability Test System)
-        df_bus = pd.read_csv(system_dir / "SourceData" / "bus.csv", index_col=[0])
-        df_line = pd.read_csv(system_dir / "SourceData" / "branch.csv", index_col=[0])
-        df_gen = pd.read_csv(system_dir / "SourceData" / "gen.csv", index_col=[0])
-        df_ts_pointer = pd.read_csv(system_dir / "SourceData" / "timeseries_pointers.csv")
+        df_bus = pd.read_csv(system_dir / system_config / "bus.csv", index_col=[0])
+        df_line = pd.read_csv(system_dir / system_config / "branch.csv", index_col=[0])
+        df_gen = pd.read_csv(system_dir / system_config / "gen.csv", index_col=[0])
 
         # Select unit types
         unit_types = ["CT", "STEAM", "CC", "NUCLEAR", "PV", "RTPV", "WIND", "STORAGE"]
@@ -409,6 +381,7 @@ class System:
 
     def solve_opf(self, date):
         # Solve CVXPY model
+        self.opf_date = date
 
         # Update time series parameters
         for obj in self.components:
@@ -418,3 +391,91 @@ class System:
         result = self.prob.solve(solver=cp.GUROBI)
 
         return result
+
+    @property
+    def dispatch_results(self):
+        # Collect dispatch results
+        df_dispatch = pd.DataFrame()
+        df_dispatch["load"] = sum(node.load.value for node in self.nodes.values())
+        df_dispatch["thermal"] = sum(resource.p_out.value for resource in self.thermal_resources.values())
+        df_dispatch["solar"] = sum(resource.p_out.value for resource in self.variable_resources.values() if resource.resource_type == "solar")
+        df_dispatch["wind"] = sum(resource.p_out.value for resource in self.variable_resources.values() if resource.resource_type == "wind")
+        df_dispatch["storage charge"] = sum(resource.charge.value for resource in self.storage_resources.values())
+        df_dispatch["storage discharge"] = sum(resource.discharge.value for resource in self.storage_resources.values())
+        df_dispatch["unserved energy"] = sum(node.unserved_energy.value for node in self.nodes.values())
+
+        # Correct index
+        df_dispatch.index = pd.date_range(start=self.opf_date, periods=24, freq="h", tz="UTC")
+
+        return df_dispatch
+
+    @staticmethod
+    def dispatch_plot(df_dispatch):
+        # Copy dataframe
+        df_dispatch = df_dispatch.copy()
+
+        # Correct index
+        df_dispatch = pd.concat([df_dispatch.iloc[8:], df_dispatch.iloc[0:8]])
+        df_dispatch = df_dispatch.reset_index()
+
+        plt.figure(figsize=(9, 5))
+        time = df_dispatch.index
+        plt.plot(
+            time,
+            df_dispatch["load"],
+            color="black",
+            linewidth=3,
+            label="load",
+        )
+        plt.plot(
+            time,
+            df_dispatch["load"] + df_dispatch["storage charge"],
+            color="black",
+            linewidth=2,
+            linestyle="--",
+            label="load + storage charge",
+        )
+        plt.stackplot(
+            time,
+            df_dispatch["solar"], df_dispatch["wind"], df_dispatch["thermal"], df_dispatch["storage discharge"],
+            df_dispatch["unserved energy"],
+            labels=("solar", "wind", "thermal", "storage discharge", "unserved energy"),
+            colors=("gold", "skyblue", "lightgrey", "purple", "red"),
+        )
+        plt.legend(fontsize=9)
+        plt.axis([0, 23, 0, None])
+        plt.xlabel("Time (h)")
+        plt.ylabel("MW")
+        plt.show()
+
+    def simulate_year(self, year):
+
+        # Read in time series data for  year
+        self.read_timeseries(year)
+
+        # Create CVXPY OPF model
+        self.write_opf()
+
+        # Store results
+        df_results = pd.DataFrame(
+            index=pd.date_range(f"{year}-01-01 00:00:00", f"{year}-12-31 23:59:59", freq="d"),
+            columns=["Cost", "Unserved Energy"],
+        )
+        df_LMP = pd.DataFrame(
+            index=pd.date_range(f"{year}-01-01 00:00:00", f"{year}-12-31 23:59:59", freq="h"),
+            columns=list(self.nodes.keys()),
+        )
+
+        # Simulate each day
+        for date in df_results.index:
+            # Re-solve model
+            self.solve_opf(date)
+
+            # Save results
+            df_results.loc[date, "Cost"] = self.total_variable_costs.value
+            df_results.loc[date, "Unserved Energy"] = cp.sum(
+                cp.sum([n.unserved_energy for n in self.nodes.values()])).value
+            for n in self.nodes.keys():
+                df_LMP.loc[date:date + pd.Timedelta(hours=T - 1), n] = -self.nodes[n].power_balance_constraint.dual_value
+
+        return df_results, df_LMP
