@@ -1,5 +1,0 @@
-mpc = loadcase('RTS_GMLC.m')
-rundcpf(mpc)
-runpf(mpc)
-rundcopf(mpc)
-runopf(mpc)
