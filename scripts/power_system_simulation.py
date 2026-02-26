@@ -8,6 +8,71 @@ import pathlib
 
 T = 24  # Time window of optimization model(s)
 
+### HELPERS ###
+
+import numpy as np
+
+def forced_outage_profile(FOR: float, MTTR: float, T: int,
+                          rng: np.random.Generator | None = None) -> np.ndarray:
+    """
+    Generate a binary availability profile of length T.
+
+    State convention:
+        1 = available (up)
+        0 = forced outage (down)
+
+    Parameters
+    ----------
+    FOR : float
+        Stationary forced outage rate (probability of being down).
+    MTTR : float
+        Mean time to repair (in time steps).
+    T : int
+        Simulation length.
+    rng : numpy.random.Generator, optional
+
+    Returns
+    -------
+    profile : np.ndarray (uint8)
+        Length-T binary availability vector.
+    """
+
+    if not (0.0 < FOR < 1.0):
+        raise ValueError("FOR must be in (0,1).")
+    if MTTR <= 0.0:
+        raise ValueError("MTTR must be positive.")
+    if T <= 0:
+        raise ValueError("T must be positive.")
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # Calibrate transition probabilities
+    p10 = 1.0 / MTTR                       # down -> up
+    p01 = (FOR / (1.0 - FOR)) * p10        # up -> down
+
+    if p01 >= 1.0:
+        raise ValueError("Implied failure probability >= 1. Check FOR/MTTR consistency.")
+
+    profile = np.empty(T, dtype=np.uint8)
+
+    # Random initial state from stationary distribution
+    profile[0] = 1 if rng.random() < (1.0 - FOR) else 0
+
+    # Pre-generate uniforms for speed
+    u = rng.random(T - 1)
+
+    for t in range(1, T):
+        if profile[t - 1] == 1:
+            # up -> down
+            profile[t] = 0 if u[t - 1] < p01 else 1
+        else:
+            # down -> up
+            profile[t] = 1 if u[t - 1] < p10 else 0
+
+    return profile
+
+
 ### NODE ###
 class Component:
 
@@ -50,7 +115,6 @@ class Node(Component):
 
         # Set other, generic attributes
         self.VOLL = 1e4  # $/MWh of unserved energy
-        self.theta_max = np.deg2rad(30)  # 30 degree maximum voltage angle
 
         # Initialize resources
         self.resources = []
@@ -76,27 +140,35 @@ class Node(Component):
 
     def create_parameters(self):
         self.load = cp.Parameter(T)
+        self.perfect_capacity = cp.Parameter(T)
 
     def update_timeseries_parameters(self, date: pd.Timestamp):
         self.load.value = self.peak_load * self.load_profile.loc[date:date + pd.Timedelta(hours=T - 1)].values
 
+    def update_perfect_capacity_parameter(self, perfect_capacity_value):
+        self.perfect_capacity.value = np.repeat(perfect_capacity_value, T)
+
     def create_variables(self):
+        self.perfect_generation = cp.Variable(T)
         self.unserved_energy = cp.Variable(T, nonneg=True)
-        self.theta = cp.Variable(T)
 
     def write_constraints(self):
         constraints = [
-            cp.sum([r.p_out for r in self.resources])  # Nodal generation
+            cp.sum([r.p_out for r in self.resources])  # nodal generation
             + cp.sum([l.flow for l in self.in_lines])  # + line inflows
             - cp.sum([l.flow for l in self.out_lines])  # - line outflows
-            == self.load - self.unserved_energy,  # = load minus unserved energy (power balance constraint)
-            self.unserved_energy <= self.load,  # Limit unserved energy
-            self.theta <= self.theta_max, self.theta >= -self.theta_max  # Voltage angle limits
+            + self.perfect_generation # + generation from perfect capacity
+            + self.unserved_energy # + unserved energy
+            == self.load, # = load (power balance constraint)
+            self.perfect_generation <= self.perfect_capacity, # (max perfect capacity constraint)
         ]
         self.power_balance_constraint = constraints[0]
-        if self.node_type == "Ref":
-            constraints += [self.theta == 0.0]
+        self.max_perfect_capacity = constraints[1]
         return constraints
+
+    @property
+    def power_balance_duals(self):
+        return self.power_balance_constraint.dual_value
 
 
 ### LINE ###
@@ -112,8 +184,10 @@ class Line(Component):
         # Unpack line attributes from data
         self.from_node_ID = data["From Bus"]
         self.to_node_ID = data["To Bus"]
-        self.max_flow = data[ "LTE Rating"]  # Long-term flow limit; alternatively can use continuous/short-term limits
+        self.flow_limit = data[ "LTE Rating"]  # Long-term flow limit; alternatively can use continuous/short-term limits
         self.X = data["X"]  # Line susceptance # MVA base = 100?
+        self.FOR = data["Perm OutRate"]
+        self.MTTR = data["Duration"]
 
         # Initialize other parameters
         self.baseMVA = 100.0
@@ -134,16 +208,23 @@ class Line(Component):
         nodes[self.from_node_ID].out_lines.append(self)
         nodes[self.to_node_ID].in_lines.append(self)
 
+    def create_parameters(self):
+        self.max_flow = cp.Parameter(T)
+
+    def update_timeseries_parameters(self, date: pd.Timestamp):
+        self.max_flow.value = self.flow_limit * forced_outage_profile(self.FOR, self.MTTR, T)
+
     def create_variables(self):
         self.flow = cp.Variable(T)
 
     def write_constraints(self):
-        return [
+        constraints = [
             self.flow <= self.max_flow,
             self.flow >= -self.max_flow,
-            self.flow == (1 / self.X) * self.baseMVA * (self.from_node.theta - self.to_node.theta)
         ]
-
+        self.forward_flow_limit_constraint = constraints[0]
+        self.reverse_flow_limit_constraint = constraints[1]
+        return constraints
 
 ### RESOURCES ###
 
@@ -158,7 +239,7 @@ class Resource(Component):
         # Unpack basic resource attributes from data
         self.node_ID = data["Bus ID"]  # Bus ID
         self.unit_type = data["Unit Type"]  # Unit type
-        self.pmax = data["PMax MW"]  # Nameplate capacity (MW)
+        self.nameplate_capacity = data["PMax MW"]  # Nameplate capacity (MW)
         self.VOM = data["VOM"]  # Variable O&M costs ($/MWh)
 
         # Initialize node
@@ -174,11 +255,23 @@ class Resource(Component):
         # Link resource to node
         nodes[self.node_ID].resources.append(self)
 
+    def create_parameters(self):
+        self.pmax = cp.Parameter(T)
+
+    def update_timeseries_parameters(self, date: pd.Timestamp):
+        self.pmax.value = np.repeat(self.nameplate_capacity, T)
+
     def create_variables(self):
         self.p_out = cp.Variable(T, nonneg=True)
 
     def write_constraints(self):
-        return [self.p_out <= self.pmax]
+        constraints = [self.p_out <= self.pmax]
+        self.pmax_constraint = constraints[0]
+        return constraints
+
+    @property
+    def pmax_duals(self):
+        return self.pmax_constraint.dual_value
 
 
 class ThermalResource(Resource):
@@ -197,6 +290,11 @@ class ThermalResource(Resource):
         self.pmin = data["PMin MW"]  # Minimum output (for unit commitment
         self.ramp_rate = 60 * data["Ramp Rate MW/Min"]
         self.FOR = data["FOR"]
+        self.MTTR = data["MTTR Hr"]
+
+    def update_timeseries_parameters(self, date: pd.Timestamp):
+        forced_outage_profile
+        self.pmax.value = self.nameplate_capacity * forced_outage_profile(self.FOR, self.MTTR, T)
 
 
 class VariableResource(Resource):
@@ -215,9 +313,6 @@ class VariableResource(Resource):
         # Cost attributes
         self.variable_costs = self.VOM
 
-        # Operational attributes
-        self.nameplate_capacity = data["PMax MW"]
-
         # Initialize generation profile
         self.gen_profile = None
 
@@ -233,12 +328,12 @@ class VariableResource(Resource):
         df_profile.index = pd.to_datetime(df_profile.index)
         self.gen_profile = df_profile.squeeze()
 
-    def create_parameters(self):
-        self.pmax = cp.Parameter(T)
-
     def update_timeseries_parameters(self, date: pd.Timestamp):
         self.pmax.value = self.nameplate_capacity * self.gen_profile.loc[date:date + pd.Timedelta(hours=T - 1)].values
 
+    @property
+    def pmax_duals(self):
+        return self.pmax_constraint.dual_value * (self.pmax.value / self.nameplate_capacity)
 
 class StorageResource(Resource):
 
@@ -272,8 +367,18 @@ class StorageResource(Resource):
             - self.discharge[np.mod(t - 1, T)]
             for t in range(T)
         ]
+        self.pmax_charge_constraint = constraints[0]
+        self.pmax_discharge_constraint = constraints[1]
+        self.max_SOC_constraint = constraints[2]
         return constraints
 
+    @property
+    def pmax_duals(self):
+        return self.pmax_charge_constraint.dual_value + self.pmax_discharge_constraint.dual_value
+
+    @property
+    def max_SOC_duals(self):
+        return self.max_SOC_constraint.dual_value
 
 ### SYSTEM ###
 
@@ -287,6 +392,9 @@ class System:
 
         # Current date for OPF dispatch results (placeholder)
         self.opf_date = None
+
+        # Level of perfect capacity
+        self.perfect_capacity = 0
 
         # Read in data for IEEE RTS GMLC (Reliability Test System)
         df_bus = pd.read_csv(system_dir / system_config / "bus.csv", index_col=[0])
@@ -373,8 +481,9 @@ class System:
         # Get total system variable costs
         self.total_variable_costs = cp.sum(cp.sum([cp.multiply(r.variable_costs, r.p_out) for r in self.resources.values()]))
         self.total_unserved_energy_costs = cp.sum(cp.sum([n.VOLL * n.unserved_energy for n in self.nodes.values()]))
+        self.total_unserved_energy = cp.sum(cp.sum([n.unserved_energy for n in self.nodes.values()]))
         self.total_cost = self.total_variable_costs + self.total_unserved_energy_costs # + startup costs + ... etc.
-        self.objective = cp.Minimize(self.total_cost)
+        self.objective = cp.Minimize(self.total_unserved_energy)
 
         ### Problem ###
         self.prob = cp.Problem(self.objective, self.constraints)
@@ -387,6 +496,11 @@ class System:
         for obj in self.components:
             obj.update_timeseries_parameters(date)
 
+        # Update perfect capacity at all nodes
+        n = len(self.nodes)
+        for node in self.nodes.values():
+            node.update_perfect_capacity_parameter((1 / n) * self.perfect_capacity)
+
         # Solve model
         result = self.prob.solve(solver=cp.GUROBI)
 
@@ -396,7 +510,7 @@ class System:
     def dispatch_results(self):
         # Collect dispatch results
         df_dispatch = pd.DataFrame()
-        df_dispatch["load"] = sum(node.load.value for node in self.nodes.values())
+        df_dispatch["load"] = sum(node.load.value - node.perfect_capacity.value for node in self.nodes.values())
         df_dispatch["thermal"] = sum(resource.p_out.value for resource in self.thermal_resources.values())
         df_dispatch["solar"] = sum(resource.p_out.value for resource in self.variable_resources.values() if resource.resource_type == "solar")
         df_dispatch["wind"] = sum(resource.p_out.value for resource in self.variable_resources.values() if resource.resource_type == "wind")
@@ -465,6 +579,10 @@ class System:
             index=pd.date_range(f"{year}-01-01 00:00:00", f"{year}-12-31 23:59:59", freq="h"),
             columns=list(self.nodes.keys()),
         )
+        df_MRI = pd.DataFrame(
+            index=pd.date_range(f"{year}-01-01 00:00:00", f"{year}-12-31 23:59:59", freq="h"),
+            columns=list(self.nodes.keys()),
+        )
 
         # Simulate each day
         for date in df_results.index:
@@ -473,8 +591,7 @@ class System:
 
             # Save results
             df_results.loc[date, "Cost"] = self.total_variable_costs.value
-            df_results.loc[date, "Unserved Energy"] = cp.sum(
-                cp.sum([n.unserved_energy for n in self.nodes.values()])).value
+            df_results.loc[date, "Unserved Energy"] = self.total_unserved_energy.value
             for n in self.nodes.keys():
                 df_LMP.loc[date:date + pd.Timedelta(hours=T - 1), n] = -self.nodes[n].power_balance_constraint.dual_value
 
